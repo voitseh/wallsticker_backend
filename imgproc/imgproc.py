@@ -323,11 +323,12 @@ def draw_sticker(image, sticker, mask, wall_bound_box, repeat_x=1, repeat_y=1, p
         sticker = tile_sticker(sticker, repeat_x, repeat_y, (wallh, wallw))
 
     sticker = sticker[:int(wallh), :int(wallw)]
+    
     sticker_padded = resizeWithPadding(sticker, wall_bound_box[0], mask.shape)
 
     #if perspective_matrix is not None:
         #sticker_padded = cv2.warpPerspective(sticker_padded, perspective_matrix, ( mask.shape[1],mask.shape[0] ))
-        
+    
     colored_mask = cv2.bitwise_and(sticker_padded,sticker_padded,mask=mask) 
     
 

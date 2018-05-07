@@ -1,15 +1,12 @@
-from flask import Flask, g, url_for
-from flask_cors import CORS
-from flask import render_template
-import uuid
 import flask_sijax
 import os, glob
-from imgproc import imgproc as impr
-from threading import Timer
-import  base64 
-import cv2
-import numpy as np
+import utils
+import imgutils
 import logging
+from flask import Flask, g
+from flask_cors import CORS
+from flask import render_template
+from os.path import exists
 
 # The path where you want the extension to create the needed javascript files
 # DON'T put any of your files in this directory, because they'll be deleted!
@@ -23,354 +20,393 @@ app.config['SIJAX_STATIC_PATH'] = path
 app.config['SIJAX_JSON_URI'] = '/static/js/sijax/json2.js'
 flask_sijax.Sijax(app)
 
-APP_ROOT = "/home/voitseh/Projects/wallsticker"
 UPLOAD_FOLDER = os.path.join(app.root_path, 'static/images')
 WALL_FOLDER = os.path.join(UPLOAD_FOLDER, 'wall_gallery')
+MASK_FOLDER = os.path.join(UPLOAD_FOLDER, 'mask_gallery')
 STICKER_FOLDER = os.path.join(UPLOAD_FOLDER, 'sticker_gallery')
+WALL_THUMBNAILS = os.path.join(UPLOAD_FOLDER, 'wall_thumbnails')
+STICKER_THUMBNAILS = os.path.join(UPLOAD_FOLDER, 'sticker_thumbnails')
+TMP_FOLDER = os.path.join(UPLOAD_FOLDER, 'tmp')
+
+automode_files = {'wallFilePath': None, 'maskFilePath': None, 'stickerFilePath': None}
+automode_settings = {'sticker_center': False, 'repeat_x': None, 'repeat_y': None, 'opacity': None}
+
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024
 
-curFrame = None
-gallery_ID = ""
-
-# temporary filenames for top galleries auto editing
-wallFile = ""
-stickerFile = ""
-
-sticker_center = False
-repeat_x = None
-repeat_y = None
-opacity = None
-
-filenames_list = []
-
-class Frame:
-    def __init__(self,id):
-        self.id = id
-        self.items = {'wallFile':'', 'maskFile':'','stickerFile':''}
-
-
-#################### PROCESS IMAGE ###############################
-def b64file_extension(b64file):
-    ext = b64file.split(',')[0].split('/')[1].split(';')[0]
-    return ext
-
-def decode_img(b64file, f_name):
-    if ',' in b64file:
-        imgdata = b64file.split(',')[1]
-        decoded = base64.b64decode(imgdata)
-        write_file(f_name, decoded)
-
-def encode_img(filename):
-    with open(filename, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read())
-    return encoded_string
-
-def process_base64(filename):
-    filename = str(filename).split("b'")[-1].split("b'")[-1][:-1]
-    filename = 'data:image/png;base64,{}'.format(filename)
-    return filename
-
-def autoEditTopGaleryImgs(obj_response, wallFile, stickerFile):
-    # auto edit images from top galleries  
-    if wallFile != "" and stickerFile != "":
-        process(obj_response, wallFile, stickerFile);
-
-def autoEditBottomGaleryImgs(obj_response, curFrame):
-    # auto edit images from bottom gallery
-    if curFrame != None:
-        if  curFrame.items['wallFile'] != '' and curFrame.items['stickerFile'] != '':
-            remove_img(obj_response, 'theImg')
-            process(obj_response, curFrame.items['wallFile'], curFrame.items['stickerFile'], curFrame.items['maskFile']);
-            
-
-#################### UTILS ###############################
-def save_file(file,filename):
-    file.save(filename)
-  
-def rename_file(folder, prefix, file_ext):
-    filename = os.path.join(folder, prefix + str(uuid.uuid4())+ '.{}'.format(file_ext))
-    return filename
-
-def remove_file(filename, default_folder = app.config['UPLOAD_FOLDER']):
-    filepath = os.path.join(default_folder,filename)
-    if os.path.isfile(filepath):
-        os.remove(filepath)
-
-def remove_files(file_dict):
-    for key, value in file_dict.items():
-        remove_file(value)
-
-def write_file(f_name, file):
-    with open(f_name, 'wb') as f:
-        f.write(file)
-
-#################### FOR BOTTOM GALLERY IMAGES AND LARGE IMAGE ###############################
-def remove_img(obj_response, img_id):
-    obj_response.script("$('#%s').remove()"%(img_id));
-
-def show_img(obj_response, parent_id, img_id, new_img):
-    #global native_img_dimensions
-    # process base64 image to be readeble in browser
-    new_img = process_base64(new_img)
-    obj_response.script("$('#%s').append($('<img>',{ style:'position:absolute; left:0px; top:0px; z-index: 2', name:'bottom_gallery' ,id:'%s',src:'%s'}));"%(parent_id, img_id, new_img))
+class GalleryManager:
    
-def change_img(obj_response, parent_id, img_id, new_img):
-    #remove previous image from gallery
-    if img_id != None:
-        remove_img(obj_response, img_id);
-    #send new image to frame
-    show_img(obj_response, parent_id, img_id, new_img)
+    _img_name_prefix = ''
+
+    _img_thumb_path = ''
    
-def response(obj_response, parent_id, img_id, filename):
-    #global native_img_dimensions
-    #native_img_dimensions = get_img_native_dimensions(filename)
-    new_img = encode_img(filename)
-    change_img(obj_response, parent_id, img_id, new_img)
-    filenames_list.append(filename)
-   
-    
-###################### GALLERIES ##############################
-def remove_gallery_imgs(obj_response, parent_id):
-    obj_response.script("$('#%s').children().remove()"%(parent_id));
+    _loaded_img_path, _loaded_img_src, _loaded_img_thumb_path = '', '', ''
 
-def show_gallery_img(obj_response, parent_id, img_id, new_img, del_id):
-    img_name = new_img.split('wall_gallery/')[-1]  if gallery_ID == 'wall_gallery' else new_img.split('sticker_gallery')[-1]
-    file_address = UPLOAD_FOLDER + new_img.split('images')[-1]
-    new_img = encode_img(file_address)
-    new_img = process_base64(new_img)
-    obj_response.script("$('#%s').append($('<li>',{class:'image_grid'}).append($('<a href=#>').append($('<label>').append($('<img>',{id:'%s', src:'%s', name:'%s'})).append($('<input>',{type:'radio', name:'selimg'})).append($('<span>',{class:'caption'})).append($('<span>',{id:'%s'})))));"%(parent_id, img_id, new_img, img_name, del_id))
-   
-def response_to_gallery(obj_response, parent_id, img_id, filename, del_id):
-    filename = filename.split('/')[-1]
-    result = url_for('static', filename='images/{}/{}'.format(parent_id,filename))
-    show_gallery_img(obj_response, parent_id, img_id, result, del_id) 
+    _clicked_img_name, _clicked_img_path, _clicked_img_src = '', '', ''
 
-def fill_gallery(obj_response, src_dir, gallery_ID):
-    index = 0
-    remove_gallery_imgs(obj_response, gallery_ID)
-    if os.path.exists(src_dir):
-        for filename in glob.glob(os.path.join( src_dir, "*.*")):
-            img_id = '_img{}'.format(str(index))
-            del_id = 'del_wall{}'.format(str(index)) if gallery_ID == 'wall_gallery' else 'del_sticker{}'.format(str(index))
-            index += 1
-            #senf new image to frame
-            response_to_gallery(obj_response, gallery_ID, img_id, filename, del_id) 
-    else: 
-         print("{} is not exist!".format(src_dir))
+    _deleted_img_name = ''
 
-################# RESPONSE MASK ########################
-def black_to_transparent(file_name):
-    src = cv2.imread(file_name, 1)
-    tmp = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
-    _,alpha = cv2.threshold(tmp,0,255,cv2.THRESH_BINARY)
-    b, g, r = cv2.split(src)
-    rgba = [b,g,r, alpha]
-    dst = cv2.merge(rgba,4)
-    cv2.imwrite(file_name, dst)
-
-def send_wall_mask(obj_response, wall_path):
-    wall = cv2.imread(wall_path, cv2.IMREAD_COLOR)
-    mask, bound_box, contour = impr.generate_mask(wall)
-    mask_path = os.path.join(UPLOAD_FOLDER, 'mask-' + str(uuid.uuid4())+ '.png')
-    cv2.imwrite(mask_path, mask)
-    black_to_transparent(mask_path)
-    mask_img = encode_img(mask_path)
-    mask_img = process_base64(mask_img)
-    obj_response.script("$(mask).attr('src','%s');"%mask_img)
-    timer = Timer(7, remove_file, [mask_path.split('images/')[-1]])
-    timer.start()
-    
-# save inputed Wall or Sticker files before response it to gaLLery
-def save_to_subfolder(file, gallery_ID):
-    if not os.path.exists(WALL_FOLDER):
-        os.makedirs(WALL_FOLDER)
-    if not os.path.exists(STICKER_FOLDER):
-        os.makedirs(STICKER_FOLDER)
-    file_ext = file.split('.')[-1]
-    if gallery_ID == 'wall_gallery':
-        filename = rename_file(WALL_FOLDER, 'wall-', file_ext)
-        save_file(file,filename)
-    else:
-        filename = rename_file(STICKER_FOLDER, 'sticker-', file_ext)
-        save_file(file,filename)
-
-class SijaxHandler(object):
-    
-    """A container class for all Sijax handlers.
-    Grouping all Sijax handler functions in a class
-    (or a Python module) allows them all to be registered with
-    a single line of code.
-    """
-    # data from current Frame object
-    @staticmethod
-    def client_data(obj_response, client_data):
-        global  clickedBttnName, gallery_ID, wallFile, stickerFile, curFrame, sticker_center,repeat_x,repeat_y,opacity
-        # handle adding new bottom gallery frame
-        if  'lastFrameId' in client_data:
-            lastFrameId = client_data['lastFrameId']
-            curFrame = Frame(lastFrameId)
+    def __init__(self, obj_response, IMG_FOLDER, IMG_THUMBNAILS, gallery_id, img_id_prefix, delbttn_id_prefix, img_type):
+        self._IMG_FOLDER, self._IMG_THUMBNAILS = IMG_FOLDER, IMG_THUMBNAILS
+        self._gallery_image_id_index = utils.get_number_of_files_in_directory(self._IMG_FOLDER)
+        self._gallery_id, self._img_id_prefix, self._delbttn_id_prefix, self.img_type = gallery_id, img_id_prefix, delbttn_id_prefix, img_type
+        self._obj_response = obj_response
+       
+    #####################################################################################
+    def reload_gallery(self):
+        self.clear_gallery()
+        self.fill_gallery_with_images()  
+     
+    def clear_gallery(self):
+        self._obj_response.script("$('#%s').children().remove()"%(self._gallery_id));
         
-        # handle current frame id 
-        if  'curFrameId' in client_data:
-            curFrame.id = client_data['curFrameId']
+    def fill_gallery_with_images(self):
+        self._gallery_image_id_index = 0
+        for img_thumb_path in glob.glob(os.path.join(self._IMG_THUMBNAILS, "*.*")):
+            self._img_thumb_path = img_thumb_path
+            self.__response_gallery_img()
+            self._gallery_image_id_index += 1
+
+    def __response_gallery_img(self):
+        img_name, img_src, img_id, delbttn_id = self.__make_img_attrs()
+        self._obj_response.script("$('#%s').append($('<li>',{class:'image_grid'}).append($('<a href=#>').append($('<label>').append($('<img>',{id:'%s', src:'%s', name:'%s'})).append($('<input>',{type:'radio', name:'selimg'})).append($('<span>',{class:'caption'})).append($('<span>',{id:'%s', src:''})))));"%(self._gallery_id, img_id, img_src, img_name, delbttn_id))
+
+    def __make_img_attrs(self):
+        img_name = self._img_thumb_path.split('/')[-1]
+        img_src = imgutils.encode_img(self._img_thumb_path)
+        img_id = '{}{}'.format(self._img_id_prefix, str(self._gallery_image_id_index))
+        delbttn_id = '{}{}'.format(self._delbttn_id_prefix, str(self._gallery_image_id_index))
+        return img_name, img_src, img_id, delbttn_id
+
+    ########################################################################################
+    def on_input_new_img_bttn_click(self):
+        self._create_img_path()
+        self._create_img_thumb_path()
+        imgutils.decode_img_and_save_to_folder(self._loaded_img_src, self._loaded_img_path)
+        imgutils.make_and_save_thumbnail(self._loaded_img_path, self._loaded_img_thumb_path)
+        self._img_thumb_path = self._loaded_img_thumb_path
+        self.__response_gallery_img()
+        self._gallery_image_id_index += 1
+
+    def _create_img_path(self):
+        img_file_ext = utils.get_file_extension(self._loaded_img_src)
+        img_name = utils.create_filename('{}-'.format(self._img_name_prefix), img_file_ext)
+        self._loaded_img_path = utils.create_filepath(self._IMG_FOLDER, img_name)
         
-        # handle deleted top gallery image
-        if  'delGalleryImg' in client_data:
-            filename = client_data['delGalleryImg']
-            remove_file(filename, WALL_FOLDER) if gallery_ID == 'wall_gallery' else remove_file(filename.split('/')[-1], STICKER_FOLDER)
+    def _create_img_thumb_path(self):
+        self._loaded_img_thumb_path = utils.create_filepath(self._IMG_THUMBNAILS, self._loaded_img_path.split('/')[-1])
         
-        # handle Wall || Sticker gallery checked Event to fill appropriate gallery
-        if  'wall_gallery' in client_data:
-            gallery_ID = client_data['wall_gallery']
-            fill_gallery(obj_response, WALL_FOLDER, gallery_ID)
+    #########################################################################################
+    def on_del_img_bttn_click(self):
+        self.__del_img_from_folder()
+        self.__del_img_thumb_from_folder()
+
+    def __del_img_from_folder(self):
+        img_path = os.path.join(self._IMG_FOLDER, self._deleted_img_name)
+        utils.remove_file(img_path)
+
+    def __del_img_thumb_from_folder(self):
+        img_thumb_path = os.path.join(self._IMG_THUMBNAILS, self._deleted_img_name)
+        utils.remove_file(img_thumb_path)
+
+    ########################################################################################
+    def on_img_clicked(self):
+        self._clicked_img_path = utils.create_filepath(self._IMG_FOLDER, self._clicked_img_name)
+        self._clicked_img_src = imgutils.encode_img(self._clicked_img_path)
+        self._send_img_to_canvas()
+       
+    def _send_img_to_canvas(self):
+        self._obj_response.script("$(%s).attr('src','%s');"%(self.img_type, self._clicked_img_src))
+
+class WallGalleryManager(GalleryManager):
+
+    __wall_gallery_image_id_index = 0
+
+    __custom_mask_name, __custom_mask_src, __custom_mask_id_index = '', '', ''
+    __target_html_element_where_custom_mask_will_be_added_id = ''
+
+    __tooltip_text_of_wall_where_custom_mask_loads = ''
+
+    __common_substring_of_wall_and_appropriate_mask_names = ''
+
+    def __init__(self, obj_response):
+        global WALL_FOLDER, WALL_THUMBNAILS, MASK_FOLDER
+        self.__gallery_id, self.__img_id_prefix, self.__delbttn_id_prefix, self.__img_type = 'wall_gallery', '_wall', 'del_wall', 'image'
+        GalleryManager.__init__(self, obj_response, WALL_FOLDER, WALL_THUMBNAILS, self.__gallery_id, self.__img_id_prefix, self.__delbttn_id_prefix, self.__img_type)
+        
+    ###############################################################################################
+    def reload_walls_and_masks_gallery(self):
+        super().clear_gallery()
+        self.__fill_gallery_with_walls()
+        self.__fill_gallery_with_masks()
+
+    def __fill_gallery_with_walls(self):
+        super().fill_gallery_with_images()
+    
+    def __fill_gallery_with_masks(self):
+        self.__wall_gallery_image_id_index = 0
+        for wall_thumb_path in glob.glob(os.path.join(self._IMG_THUMBNAILS, "*.*")):
+            self._img_thumb_path = wall_thumb_path
+            self.__create_common_substring_of_wall_and_mask_names()
+            self.__response_appropriate_mask()
+            self.__wall_gallery_image_id_index += 1
+
+    def __create_common_substring_of_wall_and_mask_names(self):
+        self.__common_substring_of_wall_and_appropriate_mask_names = self._img_thumb_path.split('wall-')[-1].split('.')[0]
+       
+    
+    def __response_appropriate_mask(self):
+        appropriate_mask_src = self.__make_mask_src()
+        target_element_for_mask_adding_id = '{}{}'.format(self.__delbttn_id_prefix, self.__wall_gallery_image_id_index)
+        self._obj_response.script("$('#%s').attr('src', '%s')"%(target_element_for_mask_adding_id, appropriate_mask_src))
+
+    def __make_mask_src(self):
+        mask_path = self.__get_mask_path()
+        mask_src = imgutils.encode_img(mask_path)
+        return mask_src
+
+    def __get_mask_path(self):
+        if utils.find_file_in_folder_by_filename_substring(MASK_FOLDER, self.__common_substring_of_wall_and_appropriate_mask_names) != None:
+            mask_path = utils.find_file_in_folder_by_filename_substring(MASK_FOLDER, self.__common_substring_of_wall_and_appropriate_mask_names)
+        else:
+            mask_path = utils.create_filepath(MASK_FOLDER, self._img_thumb_path.split('/')[-1].replace('wall', 'mask').split('.')[0]+'.png')
+            imgutils.process_mask(self._img_thumb_path, mask_path)
+        return mask_path
+
+    ##############################################################################################
+    def on_input_new_wall_bttn_click(self, wall_src):
+        self._img_name_prefix = 'wall'
+        self._loaded_img_src = wall_src
+        super().on_input_new_img_bttn_click()
+        self.__wall_gallery_image_id_index = self._gallery_image_id_index - 1
+        self._img_thumb_path = self._loaded_img_thumb_path
+        self.__create_common_substring_of_wall_and_mask_names()
+        self.__response_appropriate_mask()
+        
+    ##############################################################################################
+    def on_input_custom_mask_bttn_click(self, custom_mask_data):
+        self.__get_loaded_custom_mask_data(custom_mask_data)
+        custom_mask_path = utils.create_filepath(MASK_FOLDER, custom_mask_data[0])
+        self.__delete_old_mask()
+        imgutils.decode_img_and_save_to_folder(self.__custom_mask_src, custom_mask_path)
+        self.__define_target_html_element_id_for_mask_adding()
+        self.response_custom_mask()
            
-        if  'sticker_gallery' in client_data:
-            gallery_ID = client_data['sticker_gallery']
-            fill_gallery(obj_response, STICKER_FOLDER, gallery_ID)
+    def __get_loaded_custom_mask_data(self, custom_mask_data):
+        self.__custom_mask_name = custom_mask_data[0].split('.')[0]
+        self.__custom_mask_src = custom_mask_data[1]
+        self.__custom_mask_id_index = custom_mask_data[2]
+        self.__tooltip_text_of_wall_in_which_custom_mask_loads = custom_mask_data[3]
+        
+    def __define_target_html_element_id_for_mask_adding(self):
+        self.__target_html_element_where_custom_mask_will_be_added_id = '{}{}'.format(self.__img_id_prefix, self.__custom_mask_id_index) if self.__tooltip_text_of_wall_in_which_custom_mask_loads == 'show mask' else '{}{}'.format(self.__delbttn_id_prefix, self.__custom_mask_id_index)
     
-        # handle needed mask for wall gallery image
-        if 'wall_mask' in client_data:
-            wall_path = os.path.join(WALL_FOLDER, client_data['wall_mask'])
-            send_wall_mask(obj_response, wall_path)
-            # uses for top galleries images editing with auto mode
-            wallFile = wall_path
+    def __delete_old_mask(self):
+        self.__del_mask(self.__custom_mask_name)
         
-        if 'sticker' in client_data:
-            #stickerFile = os.path.join(STICKER_FOLDER, client_data['sticker'] )
-            stickerFile = STICKER_FOLDER + client_data['sticker']
+    def __del_mask(self, mask_name_substring):
+        if utils.find_file_in_folder_by_filename_substring(MASK_FOLDER, mask_name_substring) != None:
+            mask_path = utils.find_file_in_folder_by_filename_substring(MASK_FOLDER, mask_name_substring)
+            utils.remove_file(mask_path) 
+
+    def response_custom_mask(self):
+        self._obj_response.script("$('#%s').attr('src','%s');"%(self.__target_html_element_where_custom_mask_will_be_added_id, self.__custom_mask_src))
+   
+
+    #############################################################################################
+    def on_del_wall_and_appropriate_mask_bttn_click(self, img_to_be_deleted_name):
+        self._deleted_img_name = img_to_be_deleted_name
+        super().on_del_img_bttn_click()
+        self.__del_appropriate_mask()
         
-        
-        ############## dump files data ########################
-        # handle wallFile, stickerFile or maskFile loading in frame (bottom gallery)
-        if 'Wall' in client_data:
-            file_ext = b64file_extension(client_data['Wall'])
-            f_name = rename_file(UPLOAD_FOLDER, 'wall-', file_ext)
-            decode_img(client_data['Wall'], f_name)
-            curFrame.items['wallFile'] = f_name
-            response(obj_response, curFrame.id, 'img{}'.format(curFrame.id), curFrame.items['wallFile'])
-            
-        if 'Mask' in client_data:
-            file_ext = b64file_extension(client_data['Mask'])
-            f_name = rename_file(UPLOAD_FOLDER, 'mask-', file_ext)
-            decode_img(client_data['Mask'], f_name)
-            curFrame.items['maskFile'] = f_name
-            response(obj_response, curFrame.id, 'img{}'.format(curFrame.id), curFrame.items['maskFile'])
-            
-        if 'Sticker' in client_data:
-            file_ext = b64file_extension(client_data['Sticker'])
-            f_name = rename_file(UPLOAD_FOLDER, 'sticker-', file_ext)
-            decode_img(client_data['Sticker'], f_name)
-            curFrame.items['stickerFile'] = f_name
-            response(obj_response, curFrame.id, 'img{}'.format(curFrame.id), curFrame.items['stickerFile'])
+    def __del_appropriate_mask(self):
+        self.__common_substring_of_wall_and_appropriate_mask_names =  self._deleted_img_name.split('wall-')[-1].split('.')[0]
+        self.__del_mask(self.__common_substring_of_wall_and_appropriate_mask_names)
     
-        ############## top galleries ###############################
-        # handle loading new Wall file to send it into Wall gallery
-        if 'wallFile' in client_data:
-            file_ext = b64file_extension(client_data['wallFile'])
-            f_name = rename_file(WALL_FOLDER, 'wall-', file_ext)
-            decode_img(client_data['wallFile'], f_name)
-            gallery_ID = 'wall_gallery'
-            fill_gallery(obj_response, WALL_FOLDER, gallery_ID)
+    #############################################################################################
+    def on_wall_gallery_img_click(self, clicked_wall_data):
+        self._clicked_img_name = clicked_wall_data[0]
+        self.__common_substring_of_wall_and_appropriate_mask_names = self._clicked_img_name.split('wall-')[-1].split('.')[0]
+        self.__response_wall_to_canvas()
+        self._img_thumb_path = self._clicked_img_path
+        self.__response_mask_to_canvas()
+
+    def __response_wall_to_canvas(self):
+        super().on_img_clicked()
+
+    def __response_mask_to_canvas(self):
+        mask_src = self.__make_mask_src()
+        self._obj_response.script("$(mask).attr('src','%s');"%(mask_src))
+    
+   
+class StickerGalleryManager(GalleryManager):
+
+    def __init__(self, _obj_response):
+        global STICKER_FOLDER, STICKER_THUMBNAILS
+        self.__gallery_id, self.__img_id_prefix, self.__delbttn_id_prefix, self.__img_type = 'sticker_gallery', '_sticker', 'del_sticker', 'sticker'
+        super().__init__(_obj_response, STICKER_FOLDER, STICKER_THUMBNAILS, self.__gallery_id, self.__img_id_prefix, self.__delbttn_id_prefix, self.__img_type)
+
+    def reload_stickers_gallery(self):
+        super().reload_gallery() 
+     
+    def on_input_new_sticker_bttn_click(self, sticker_src):
+        self._img_name_prefix = 'sticker'
+        self._loaded_img_src = sticker_src
+        super().on_input_new_img_bttn_click()
+
+    def on_del_sticker_bttn_click(self, img_to_be_deleted_name):
+        self._deleted_img_name = img_to_be_deleted_name
+        super().on_del_img_bttn_click()
+    
+    def on_sticker_gallery_img_click(self, clicked_sticker_data):
+        self._clicked_img_name = clicked_sticker_data
+        super().on_img_clicked()
         
-        # handle loading new Sticker file to send it into Sticker gallery 
-        if 'stickerFile' in client_data:
-            file_ext = b64file_extension(client_data['stickerFile'])
-            f_name = rename_file(STICKER_FOLDER, 'sticker-', file_ext)
-            decode_img(client_data['stickerFile'], f_name)
-            gallery_ID = 'sticker_gallery'
-            fill_gallery(obj_response, STICKER_FOLDER, gallery_ID)
+
+class AutoModeManager:
+   
+    __result_img_path = ''
+   
+    def __init__(self, obj_response):
+        global TMP_FOLDER, automode_files, automode_settings
+        self.obj_response = obj_response
+        
+    def response_processed_image(self):
+        if automode_files['wallFilePath'] != None and automode_files['stickerFilePath'] != None:
+            self.__result_img_path = imgutils.process_automode_img(automode_files, automode_settings, TMP_FOLDER)
+            self.__response_automode_img()
+
+    def __response_automode_img(self):
+        self.__remove_previous_automode_img()
+        result_img_src = imgutils.encode_img(self.__result_img_path)
+        self.obj_response.script("$('#formCanvasResponse').append($('<img>',{ style:'position:absolute; left:0px; top:0px; z-index: 2', name:'bottom_gallery' ,id:'theImg',src:'%s'}));"%(result_img_src))
+    
+    def __remove_previous_automode_img(self):
+        self.obj_response.script("$('#theImg').remove()");
+   
+    def set_default_values(self):
+        utils.clear_dir(self.__TMP_FOLDER)
+        automode_files['wallFilePath'], automode_files['maskFilePath'], automode_files['stickerFilePath'] = None, None, None
+        automode_settings['sticker_center'] = False
+        automode_settings['repeat_x'], automode_settings['repeat_y'], automode_settings['opacity'] = None, None, None
+
+class Dispatcher(object):
+
+    __obj_response = ''
+    __client_data = ''
+    __custom_img_data = ''
+   
+    def __init__(self):
+        global WALL_FOLDER, WALL_THUMBNAILS, STICKER_FOLDER, STICKER_THUMBNAILS, MASK_FOLDER, TMP_FOLDER, automode_files, automode_settings 
+        self.__check_paths()
+      
+    def dispatch(self, obj_response, client_data):
+        
+        self.__obj_response = obj_response
+        self.__client_data = client_data
+        
+        self.__make_instances()
+        
+        if 'custom_wall' in self.__client_data:
+            self.__custom_img_data = self.__client_data['custom_wall']
+            automode_files['wallFilePath'] = self.__on_custom_img_loaded_to_canvas()
+            
+        if 'custom_mask' in self.__client_data:
+            self.__custom_img_data = self.__client_data['custom_mask']
+            automode_files['maskFilePath']  = self.__on_custom_img_loaded_to_canvas()
+
+        if 'custom_sticker' in self.__client_data:
+            self.__custom_img_data = self.__client_data['custom_sticker']
+            automode_files['stickerFilePath']  = self.__on_custom_img_loaded_to_canvas()
+
+        if  'wall_gallery' in self.__client_data:
+            self.__wall_gallery_manager.reload_walls_and_masks_gallery()
+
+        if  'sticker_gallery' in self.__client_data:
+            self.__sticker_gallery_manager.reload_stickers_gallery()
+        
+        if 'galleryWallFile' in self.__client_data:
+           self.__wall_gallery_manager.on_input_new_wall_bttn_click(self.__client_data['galleryWallFile'])
+          
+        if 'galleryMaskFile' in self.__client_data:
+            self.__wall_gallery_manager.on_input_custom_mask_bttn_click(self.__client_data['galleryMaskFile'])
+            
+        if 'galleryStickerFile' in self.__client_data:
+            self.__sticker_gallery_manager.on_input_new_sticker_bttn_click(self.__client_data['galleryStickerFile'])
+
+        if 'wall_mask' in self.__client_data:
+            self.__wall_gallery_manager.on_wall_gallery_img_click(self.__client_data['wall_mask'])
+            automode_files['wallFilePath']  = self.__wall_gallery_manager._clicked_img_path 
+        
+
+        if 'sticker' in self.__client_data:
+            self.__sticker_gallery_manager.on_sticker_gallery_img_click(self.__client_data['sticker'])
+            automode_files['stickerFilePath']  = self.__sticker_gallery_manager._clicked_img_path 
 
 
-        # apply result images from bottom gallery into UPLOAD_FOLDER
-        if 'imagesDict' in client_data:
-            for img_item in client_data['imagesDict']:
-                if img_item != None:
-                    if '_result' in img_item and img_item['_result'] != "":
-                        file_ext = b64file_extension(img_item['_result'])
-                        f_name = rename_file(UPLOAD_FOLDER, 'result-', file_ext)
-                        decode_img(img_item['_result'], f_name)
+        if  'delGalleryImg' in self.__client_data:
+            self.__on_delete_bttn_pressed(self.__client_data['delGalleryImg'])
+
+        if 'sticker_center' in self.__client_data: 
+            automode_settings['sticker_center'] = self.__client_data['sticker_center']
+            self.__auto_mode_manager.response_processed_image()
         
-        ########## dump auto form_values data #####################
-        # handle form values change in auto mode form
-        if 'sticker_center' in client_data:   
-            sticker_center = client_data['sticker_center']
-            autoEditTopGaleryImgs(obj_response, wallFile, stickerFile)
-            autoEditBottomGaleryImgs(obj_response, curFrame)
+        if 'repeat_x' in self.__client_data:
+            automode_settings['repeat_x'] = self.__client_data['repeat_x']
+            self.__auto_mode_manager.response_processed_image()
+    
+        if 'repeat_y' in self.__client_data:
+            automode_settings['repeat_y'] = self.__client_data['repeat_y']
+            self.__auto_mode_manager.response_processed_image()
+
+        if 'opacity' in self.__client_data:
+            automode_settings['opacity'] = self.__client_data['opacity']
+            self.__auto_mode_manager.response_processed_image()
             
-        if 'repeat_x' in client_data: 
-            repeat_x = client_data['repeat_x']
-            #autoEditTopGaleryImgs(obj_response, wallFile, stickerFile)
-            #autoEditBottomGaleryImgs(obj_response, curFrame)
+        if 'downloaded' in self.__client_data:
+            if client_data['downloaded'] == 'true':
+                self.__auto_mode_manager.set_default_values()
         
-        if 'repeat_y' in client_data:
-            repeat_y = client_data['repeat_y']
-            autoEditTopGaleryImgs(obj_response, wallFile, stickerFile)
-            autoEditBottomGaleryImgs(obj_response, curFrame)
-        
-        if 'opacity' in client_data: 
-            opacity = client_data['opacity']
-            autoEditTopGaleryImgs(obj_response, wallFile, stickerFile)
-            autoEditBottomGaleryImgs(obj_response, curFrame)
-        
-        if 'edited_and_pushed' in client_data:
-            if client_data['edited_and_pushed'] == 'true':
-                for f_name in filenames_list:
-                    remove_file(f_name)
-                del filenames_list[:]
-                #remove_files(curFrame.items)
-                curFrame.items['wallFile'] = ''
-                curFrame.items['stickerFile'] = ''
-                curFrame.items['maskFile'] = ''
-                wallFile = ''
-                stickerFile = ''
-                client_data['edited_and_pushed'] = 'false'
-                sticker_center = None
-                repeat_x = None
-                repeat_y = None
-                opacity = None
+      
+    def __check_paths(self):
+        self.__create_folder(WALL_THUMBNAILS)
+        self.__create_folder(WALL_FOLDER)
+        self.__create_folder(STICKER_THUMBNAILS)
+        self.__create_folder(STICKER_FOLDER)
+        self.__create_folder(MASK_FOLDER)
+    
+    def __create_folder(self, folder_path):
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+    def __make_instances(self):
+        self.__wall_gallery_manager = WallGalleryManager(self.__obj_response)
+        self.__sticker_gallery_manager = StickerGalleryManager(self.__obj_response)
+        self.__auto_mode_manager = AutoModeManager(self.__obj_response)
+
+
+    def __on_custom_img_loaded_to_canvas():
+        custom_img_name, custom_img_src = self.__custom_img_data[0], self.__custom_img_data[1]
+        custom_img_path = create_filepath(TMP_FOLDER, custom_img_name)
+        decode_img_and_save_to_folder(custom_img_src, custom_img_path)
+        return custom_img_path
+
+    def __on_delete_bttn_pressed(self, bttn_data):
+        img_to_be_deleted_name, delete_bttn_id = bttn_data[0], bttn_data[1]
+        self.__wall_gallery_manager.on_del_wall_and_appropriate_mask_bttn_click(img_to_be_deleted_name) if delete_bttn_id == 'delete_wall_mask' else self.__sticker_gallery_manager.on_del_sticker_bttn_click(img_to_be_deleted_name)
+          
 
 @flask_sijax.route(app, "/")
 def index():
     
     if g.sijax.is_sijax_request:
         # Sijax request detected - let Sijax handle it
-        g.sijax.register_callback('client_data', SijaxHandler.client_data) 
+        g.sijax.register_callback('client_data', Dispatcher().dispatch) 
         # The request looks like a valid Sijax request
         # The handlers are already registered above.. we can process the request
         return g.sijax.process_request()
     return render_template(index.html)
- 
 
-def process(obj_response, wallFile, stickerFile, maskFile = None):
-    global sticker_center, repeat_x, repeat_y, opacity
-    sticker_place = False
-    rx, ry = 1, 1
-    alpha = 1.0
-    if sticker_center:
-        print('sticker_center: ', sticker_center)
-        sticker_place = True
-    if repeat_x:
-        print('repx', repeat_x )
-        rx = int(repeat_x)
-    if repeat_y:
-        print('repy', repeat_y )
-        ry = int(repeat_y)
-    if opacity:
-        print('opacity: ', opacity)
-        alpha = float(opacity)
-  
-    result_name = 'result-' + str(uuid.uuid4())
-    result = impr.merge(wallFile, stickerFile, maskFile,
-                        result_name, sticker_place, rx, ry, alpha, UPLOAD_FOLDER)
-    response(obj_response, 'formCanvasResponse','theImg', result)
-   
-    tmp = os.path.join(app.root_path, result) 
-    # remove tmp files
-    tmp = os.path.join(app.root_path, result) 
-    timer = Timer(5, remove_file, [tmp])
-    timer.start()
-    
 @app.errorhandler(500)
 def server_error(e):
     logging.exception('An error occurred during a request.')
@@ -378,9 +414,7 @@ def server_error(e):
     An internal error occurred: <pre>{}</pre>
     See logs for full stacktrace.
     """.format(e), 500
-
+           
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=63100, debug=True)
-
-
-
+   app.run(host='0.0.0.0', port=63100, debug=True)
+   
