@@ -1,8 +1,12 @@
 import uuid
 import cv2
 import  base64 
+import utils
+import numpy as np
 from PIL import Image
+from wand.image import Image as wandImage
 from imgproc import imgproc as impr
+
 
 
 
@@ -10,10 +14,10 @@ def decode_img_and_save_to_folder(b64file, img_path):
     if ',' in b64file:
         imgdata = b64file.split(',')[1]
         decoded = base64.b64decode(imgdata)
-        write_file(img_path, decoded)
+        utils.write_file(img_path, decoded)
 
-def encode_img(filename):
-    with open(filename, "rb") as image_file:
+def encode_img(file_path):
+    with open(file_path, "rb") as image_file:
         encoded_string = base64.b64encode(image_file.read())
     encoded_string = str(encoded_string).split("b'")[-1].split("b'")[-1][:-1]
     encoded_string = 'data:image/png;base64,{}'.format(encoded_string)
@@ -30,18 +34,34 @@ def process_mask(img_path, mask_path):
     img = cv2.imread(img_path, cv2.IMREAD_COLOR)
     mask, bound_box, contour = impr.generate_mask(img)
     cv2.imwrite(mask_path, mask)
-    black_to_transparent(mask_path)
+    
     
 
-def black_to_transparent(file_name):
-    src = cv2.imread(file_name, 1)
+def black_to_transparent(src_path, dest_path):
+    src = cv2.imread(src_path, 1)
     tmp = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
     _,alpha = cv2.threshold(tmp,0,255,cv2.THRESH_BINARY)
     b, g, r = cv2.split(src)
     rgba = [b,g,r, alpha]
     dst = cv2.merge(rgba,4)
-    cv2.imwrite(file_name, dst)
+    cv2.imwrite(dest_path, dst)
 
+def transparent_to_black(file_path):
+    img = cv2.imread(file_path, -1)
+    result = remove_transparency(img, 0)
+    
+    cv2.imwrite(file_path, result)
+
+def remove_transparency(source, background_color):
+    source_img = cv2.cvtColor(source[:,:,:3], cv2.COLOR_BGR2GRAY)
+    source_mask = source[:,:,3]  * (1 / 255.0)
+
+    background_mask = 1.0 - source_mask
+
+    bg_part = (background_color * (1 / 255.0)) * (background_mask)
+    source_part = (source_img * (1 / 255.0)) * (source_mask)
+
+    return np.uint8(cv2.addWeighted(bg_part, 255.0, source_part, 255.0, 0.0))
 
 def process_automode_img(automode_files, automode_settings, dest_folder):
     
